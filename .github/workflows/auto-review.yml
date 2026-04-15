@@ -1,0 +1,218 @@
+# ==============================================================
+# 正大杯评审自动化工作流
+# 触发条件：当 inputs/ 目录下有 PDF 文件被推送时
+# 功能：使用 Claude Code 自动评审，生成报告上传为 Artifact
+# ==============================================================
+
+name: 📋 正大杯自动评审
+run-name: "${{ github.actor }} 提交了评审任务"
+
+# ---- 触发条件 ----
+on:
+  push:
+    paths:
+      - 'inputs/**.pdf'     # 只有 inputs/ 下的 PDF 变动才触发
+  workflow_dispatch:         # 也支持手动触发（在 Actions 页面点按钮）
+    inputs:
+      review_mode:
+        description: '评审模式'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all             # 评审 inputs/ 下所有 PDF
+          - latest          # 只评审最新推送的 PDF
+
+# ---- 权限 ----
+permissions:
+  contents: read
+
+# ---- 任务定义 ----
+jobs:
+  review:
+    name: 🔍 评审参赛材料
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # 超时保护，避免长时间运行
+
+    steps:
+      # ================================
+      # 步骤1：检出仓库代码
+      # ================================
+      - name: 📥 检出仓库
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2     # 拉取最近2次提交，用于对比新增文件
+
+      # ================================
+      # 步骤2：检测待评审的 PDF 文件
+      # ================================
+      - name: 📄 检测 PDF 文件
+        id: detect
+        run: |
+          echo "========================================"
+          echo "📂 扫描 inputs/ 目录下的 PDF 文件"
+          echo "========================================"
+
+          # 检查是否有PDF文件
+          PDF_COUNT=$(find inputs/ -maxdepth 1 -name "*.pdf" 2>/dev/null | wc -l)
+
+          if [ "$PDF_COUNT" -eq 0 ]; then
+            echo "❌ 未找到 PDF 文件"
+            echo "has_pdfs=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ 发现 $PDF_COUNT 个 PDF 文件："
+          find inputs/ -maxdepth 1 -name "*.pdf" -exec basename {} \;
+          echo "has_pdfs=true" >> $GITHUB_OUTPUT
+          echo "pdf_count=$PDF_COUNT" >> $GITHUB_OUTPUT
+
+          # 检测本次新增的文件（对比上次提交）
+          echo ""
+          echo "📌 本次新增的文件："
+          git diff --name-only --diff-filter=A HEAD~1 -- 'inputs/*.pdf' 2>/dev/null || echo "(首次提交或无法对比)"
+
+      # ================================
+      # 步骤3：安装 Claude Code
+      # ================================
+      - name: 🤖 安装 Claude Code
+        if: steps.detect.outputs.has_pdfs == 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          echo "✅ Claude Code 安装完成"
+
+      # ================================
+      # 步骤4：创建输出目录
+      # ================================
+      - name: 📁 准备输出目录
+        if: steps.detect.outputs.has_pdfs == 'true'
+        run: |
+          mkdir -p outputs
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+
+      # ================================
+      # 步骤5：逐个评审 PDF
+      # ================================
+      - name: 📝 执行评审
+        if: steps.detect.outputs.has_pdfs == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "╔══════════════════════════════════════════╗"
+          echo "║     📋 正大杯评审助手 — 自动评审         ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+
+          SUCCESS=0
+          FAIL=0
+          TOTAL=0
+
+          for PDF_FILE in inputs/*.pdf; do
+            [ -f "$PDF_FILE" ] || continue
+            TOTAL=$((TOTAL + 1))
+            BASENAME=$(basename "$PDF_FILE" .pdf)
+            OUTPUT_FILE="outputs/${BASENAME}_评审报告_${TIMESTAMP}.md"
+
+            echo "────────────────────────────────────────────"
+            echo "[$TOTAL] 🔍 正在评审: $(basename "$PDF_FILE")"
+            echo "     输出: $OUTPUT_FILE"
+            echo ""
+
+            # 调用 Claude Code 执行评审
+            claude --print \
+              "请按照以下步骤对参赛作品进行评审：
+
+              1. 先完整阅读以下三个规则文件，理解评审框架：
+                 - rules/review-prompt.md（评审角色与输出格式）
+                 - rules/scoring.md（评分维度与标准）
+                 - rules/checklist.md（形式审查清单）
+
+              2. 然后阅读待评审的 PDF 文件：
+                 - $PDF_FILE
+
+              3. 严格按照 review-prompt.md 中定义的输出格式，完成完整的评审报告。
+
+              4. 将评审报告以 Markdown 格式写入：
+                 - $OUTPUT_FILE
+
+              注意：
+              - 每个评分必须有原文依据
+              - 改进建议必须具体可操作
+              - 如有内容缺失，标记为 ⚠️ 并说明对评分的影响" \
+              2>&1 || true
+
+            # 检查是否生成了报告
+            if [ -f "$OUTPUT_FILE" ]; then
+              echo "[$TOTAL] ✅ 评审完成"
+              SUCCESS=$((SUCCESS + 1))
+            else
+              echo "[$TOTAL] ❌ 评审失败，未生成报告"
+              FAIL=$((FAIL + 1))
+              # 创建一个失败记录
+              echo "# ❌ 评审失败\n\n文件: $(basename "$PDF_FILE")\n时间: $(date)\n\n评审过程中出现错误，请手动评审。" > "$OUTPUT_FILE"
+            fi
+
+            echo ""
+          done
+
+          # 生成汇总
+          echo "════════════════════════════════════════════"
+          echo "📊 评审汇总"
+          echo "   总计: $TOTAL"
+          echo "   成功: $SUCCESS"
+          echo "   失败: $FAIL"
+          echo "════════════════════════════════════════════"
+
+          # 写入汇总文件
+          cat > outputs/评审汇总_${TIMESTAMP}.md << EOF
+          # 📊 正大杯评审汇总
+
+          - **评审时间**: $(date '+%Y-%m-%d %H:%M:%S')
+          - **触发者**: ${{ github.actor }}
+          - **提交**: ${{ github.sha }}
+          - **总计**: $TOTAL 份
+          - **成功**: $SUCCESS 份
+          - **失败**: $FAIL 份
+
+          ## 评审文件清单
+
+          $(for f in inputs/*.pdf; do [ -f "$f" ] && echo "- $(basename "$f")"; done)
+          EOF
+
+      # ================================
+      # 步骤6：上传评审报告为 Artifact
+      # ================================
+      - name: 📤 上传评审报告
+        if: steps.detect.outputs.has_pdfs == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 评审报告-${{ env.TIMESTAMP }}
+          path: outputs/
+          retention-days: 30    # 报告保留30天
+
+      # ================================
+      # 步骤7：输出结果摘要
+      # ================================
+      - name: 📋 生成结果摘要
+        if: steps.detect.outputs.has_pdfs == 'true'
+        run: |
+          echo "## 📋 正大杯评审结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 详情 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 评审文件数 | ${{ steps.detect.outputs.pdf_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 触发者 | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 时间 | $(date '+%Y-%m-%d %H:%M:%S') |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "评审报告已上传为 Artifact，请在本页面下方下载。" >> $GITHUB_STEP_SUMMARY
+
+      # ================================
+      # 无PDF时的提示
+      # ================================
+      - name: ⚠️ 无 PDF 文件
+        if: steps.detect.outputs.has_pdfs != 'true'
+        run: |
+          echo "## ⚠️ 未找到待评审文件" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "请将 PDF 文件放入 \`inputs/\` 目录后重新推送。" >> $GITHUB_STEP_SUMMARY
